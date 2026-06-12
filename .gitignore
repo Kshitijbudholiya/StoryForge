@@ -1,4 +1,9 @@
-old/*
+*old
 *__pycache__
 *.egg-info
 tests
+*.zip
+.gitignore
+*endee-data
+*endee
+*novels

@@ -1,0 +1,1 @@
+"""storyforge.core — backend AI + persistence layer."""

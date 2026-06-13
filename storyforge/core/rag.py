@@ -1,9 +1,3 @@
-"""
-storyforge.core.rag
-~~~~~~~~~~~~~~~~~~~
-RAG orchestration — bridges memory retrieval and generation.
-"""
-
 from __future__ import annotations
 
 from storyforge.core.memory import (
@@ -15,8 +9,6 @@ from storyforge.core.memory import (
 )
 from storyforge.core.generators import generate_story_package, answer_story_question
 
-
-# ── context builder ───────────────────────────────────────────────────────────
 
 def build_context(novel_id: str, query: str, story_bible: str = "") -> str:
     memory = retrieve_all_memory(novel_id, query)
@@ -31,8 +23,6 @@ def build_context(novel_id: str, query: str, story_bible: str = "") -> str:
 """
 
 
-# ── chapter generation ────────────────────────────────────────────────────────
-
 def generate_next_chapter(
     novel_id: str,
     instruction: str,
@@ -41,27 +31,17 @@ def generate_next_chapter(
 ) -> dict:
     context = build_context(novel_id, instruction, story_bible)
     package = generate_story_package(context, instruction)
-
     save_story(novel_id, chapter_number, package["chapter"])
     save_summary(novel_id, chapter_number, package["summary"])
     save_characters(novel_id, chapter_number, str(package["characters"]))
     save_lore(novel_id, chapter_number, package["lore"])
-
     return package
 
 
-# ── question answering ────────────────────────────────────────────────────────
-
-def ask_story_question(
-    novel_id: str,
-    question: str,
-    story_bible: str = "",
-) -> str:
+def ask_story_question(novel_id: str, question: str, story_bible: str = "") -> str:
     context = build_context(novel_id, question, story_bible)
     return answer_story_question(context, question)
 
-
-# ── first chapter save ────────────────────────────────────────────────────────
 
 def save_first_chapter(
     novel_id: str,
@@ -76,11 +56,5 @@ def save_first_chapter(
     save_lore(novel_id, 1, lore)
 
 
-# ── context retrieval (for external use) ─────────────────────────────────────
-
-def retrieve_story_context(
-    novel_id: str,
-    query: str,
-    story_bible: str = "",
-) -> str:
+def retrieve_story_context(novel_id: str, query: str, story_bible: str = "") -> str:
     return build_context(novel_id, query, story_bible)

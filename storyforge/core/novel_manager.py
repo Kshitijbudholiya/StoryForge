@@ -1,9 +1,3 @@
-"""
-storyforge.core.novel_manager
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Novel registry — JSON metadata + flat-file chapter storage.
-"""
-
 from __future__ import annotations
 
 import json
@@ -15,27 +9,24 @@ NOVELS_DIR.mkdir(exist_ok=True)
 
 
 class NovelManager:
-    """Manages all novel metadata and on-disk chapter/summary files."""
 
     def __init__(self) -> None:
         self.current_novel: str | None = None
         self.metadata: dict = {}
 
-    # ── Create / Load / Save ──────────────────────────────────────────────────
-
     def create_novel(self, title: str, genre: str, premise: str) -> str:
         novel_id = str(uuid.uuid4())
         metadata = {
-            "novel_id":       novel_id,
-            "title":          title,
-            "genre":          genre,
-            "premise":        premise,
+            "novel_id": novel_id,
+            "title": title,
+            "genre": genre,
+            "premise": premise,
             "current_chapter": 1,
-            "characters":     [],
-            "locations":      [],
-            "factions":       [],
-            "lore_topics":    [],
-            "created":        True,
+            "characters": [],
+            "locations": [],
+            "factions": [],
+            "lore_topics": [],
+            "created": True,
         }
         self._novel_dir(novel_id).mkdir(parents=True, exist_ok=True)
         self.save_metadata(novel_id, metadata)
@@ -57,8 +48,6 @@ class NovelManager:
         path = NOVELS_DIR / f"{novel_id}.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(metadata, f, indent=4, ensure_ascii=False)
-
-    # ── Disk chapter storage ──────────────────────────────────────────────────
 
     def _novel_dir(self, novel_id: str | None = None) -> Path:
         return NOVELS_DIR / (novel_id or self.current_novel)  # type: ignore[operator]
@@ -83,8 +72,6 @@ class NovelManager:
         d = self._novel_dir(novel_id or self.current_novel)
         return sorted(d.glob("chapter_*.txt")) if d.exists() else []
 
-    # ── Chapter counter ───────────────────────────────────────────────────────
-
     def update_chapter(self) -> int:
         self.metadata["current_chapter"] += 1
         self.save_metadata(self.current_novel, self.metadata)  # type: ignore[arg-type]
@@ -92,8 +79,6 @@ class NovelManager:
 
     def get_current_chapter(self) -> int:
         return self.metadata.get("current_chapter", 1)
-
-    # ── Metadata population ───────────────────────────────────────────────────
 
     def add_character(self, name: str) -> None:
         if name and name not in self.metadata["characters"]:
@@ -116,24 +101,29 @@ class NovelManager:
             self.save_metadata(self.current_novel, self.metadata)  # type: ignore[arg-type]
 
     def apply_lore_extraction(self, lore_text: str) -> None:
-        """Parse structured markdown from extract_lore() into metadata fields."""
         if not lore_text:
             return
-
         section = None
         location_headers = {"locations", "location"}
-        faction_headers  = {"factions", "faction", "political systems", "political system"}
-        lore_headers     = {
-            "magic systems", "magic system", "technology", "history",
-            "world rules", "lore", "other",
+        faction_headers = {
+            "factions",
+            "faction",
+            "political systems",
+            "political system",
         }
-
+        lore_headers = {
+            "magic systems",
+            "magic system",
+            "technology",
+            "history",
+            "world rules",
+            "lore",
+            "other",
+        }
         for line in lore_text.splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
-
-            # Section header: lines starting with #
             if stripped.startswith("#"):
                 header_text = stripped.lstrip("# ").rstrip(":").lower()
                 if header_text in location_headers:
@@ -145,8 +135,6 @@ class NovelManager:
                 else:
                     section = None
                 continue
-
-            # Bullet item under active section
             if stripped.startswith(("-", "*")):
                 item = stripped.lstrip("-* ").split(":")[0].strip()
                 if not item:
@@ -158,8 +146,6 @@ class NovelManager:
                 elif section == "lore":
                     self.add_lore_topic(item)
 
-    # ── Listing ───────────────────────────────────────────────────────────────
-
     def list_novels(self) -> list[dict]:
         out = []
         for f in NOVELS_DIR.glob("*.json"):
@@ -168,9 +154,9 @@ class NovelManager:
                 out.append(
                     {
                         "novel_id": data.get("novel_id"),
-                        "title":    data.get("title"),
-                        "genre":    data.get("genre"),
-                        "chapter":  data.get("current_chapter", 1),
+                        "title": data.get("title"),
+                        "genre": data.get("genre"),
+                        "chapter": data.get("current_chapter", 1),
                     }
                 )
             except Exception:
@@ -181,8 +167,6 @@ class NovelManager:
         path = NOVELS_DIR / f"{novel_id}.json"
         if path.exists():
             path.unlink()
-
-    # ── Accessors ─────────────────────────────────────────────────────────────
 
     def get_metadata(self) -> dict:
         return self.metadata

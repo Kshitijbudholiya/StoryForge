@@ -1,9 +1,3 @@
-"""
-storyforge.core.prompts
-~~~~~~~~~~~~~~~~~~~~~~~
-Centralised LLM prompt templates.
-"""
-
 NOVEL_SYSTEM_PROMPT = """
 You are an award-winning novelist.
 

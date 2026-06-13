@@ -1,15 +1,3 @@
-"""
-storyforge.core.memory
-~~~~~~~~~~~~~~~~~~~~~~
-Multi-index Endee vector-DB memory layer.
-
-Indexes are lazily initialised on first use so importing this module
-does not require a live Endee connection.
-
-Filter values stored as strings (Endee upsert requires string filter values).
-Query filters use the $eq operator format.
-"""
-
 from __future__ import annotations
 
 from functools import lru_cache
@@ -17,16 +5,22 @@ from functools import lru_cache
 from endee import Endee, Precision
 import ollama
 
-# ── constants ─────────────────────────────────────────────────────────────────
-
-STORY_INDEX     = "story_memory"
+STORY_INDEX = "story_memory"
 CHARACTER_INDEX = "character_memory"
-LORE_INDEX      = "lore_memory"
-SUMMARY_INDEX   = "summary_memory"
+LORE_INDEX = "lore_memory"
+SUMMARY_INDEX = "summary_memory"
 
 EMBED_MODEL = "nomic-embed-text"
 
-# ── lazy client + index initialisation ───────────────────────────────────────
+EMBED_GPU_OPTIONS = {
+    "num_gpu": -1,
+    "main_gpu": 0,
+    "num_batch": 512,
+    "f16_kv": True,
+    "use_mmap": True,
+    "num_thread": 0,
+}
+
 
 @lru_cache(maxsize=None)
 def _client() -> Endee:
@@ -67,42 +61,40 @@ def _summary_index():
     return _ensure_index(SUMMARY_INDEX)
 
 
-# ── embedding ─────────────────────────────────────────────────────────────────
-
 def get_embedding(text: str) -> list[float]:
-    response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+    response = ollama.embeddings(
+        model=EMBED_MODEL,
+        prompt=text,
+        options=EMBED_GPU_OPTIONS,
+    )
     return response["embedding"]
 
-
-# ── chunking ──────────────────────────────────────────────────────────────────
 
 def chunk_text(text: str, chunk_size: int = 400) -> list[str]:
     words = text.split()
     return [
-        " ".join(words[i : i + chunk_size])
-        for i in range(0, len(words), chunk_size)
+        " ".join(words[i : i + chunk_size]) for i in range(0, len(words), chunk_size)
     ]
 
 
-# ── upsert helpers ────────────────────────────────────────────────────────────
-
-def _upsert(index, novel_id: str, doc_type: str, chapter_number: int, text: str) -> None:
+def _upsert(
+    index, novel_id: str, doc_type: str, chapter_number: int, text: str
+) -> None:
     vectors = []
     for i, chunk in enumerate(chunk_text(text)):
         vectors.append(
             {
-                "id":     f"{novel_id}_{doc_type}_{chapter_number}_{i}",
+                "id": f"{novel_id}_{doc_type}_{chapter_number}_{i}",
                 "vector": get_embedding(chunk),
                 "meta": {
                     "novel_id": novel_id,
                     "doc_type": doc_type,
-                    "chapter":  chapter_number,
-                    "text":     chunk,
+                    "chapter": chapter_number,
+                    "text": chunk,
                 },
-                # filter values must be strings for Endee
                 "filter": {
                     "novel_id": novel_id,
-                    "chapter":  str(chapter_number),
+                    "chapter": str(chapter_number),
                 },
             }
         )
@@ -126,8 +118,6 @@ def save_lore(novel_id: str, chapter_number: int, text: str) -> None:
     _upsert(_lore_index(), novel_id, "lore", chapter_number, text)
 
 
-# ── search helpers ────────────────────────────────────────────────────────────
-
 def search_index(index, novel_id: str, query: str, top_k: int = 5) -> str:
     results = index.query(
         vector=get_embedding(query),
@@ -135,9 +125,7 @@ def search_index(index, novel_id: str, query: str, top_k: int = 5) -> str:
         filter=[{"novel_id": {"$eq": novel_id}}],
     )
     memories = [
-        item["meta"]["text"]
-        for item in results
-        if item.get("meta", {}).get("text")
+        item["meta"]["text"] for item in results if item.get("meta", {}).get("text")
     ]
     return "\n\n".join(memories)
 
@@ -159,11 +147,10 @@ def retrieve_summary_memory(novel_id: str, query: str, top_k: int = 5) -> str:
 
 
 def retrieve_all_memory(novel_id: str, query: str) -> str:
-    story      = retrieve_story_memory(novel_id,     query, top_k=8)
+    story = retrieve_story_memory(novel_id, query, top_k=8)
     characters = retrieve_character_memory(novel_id, query, top_k=6)
-    lore       = retrieve_lore_memory(novel_id,      query, top_k=6)
-    summaries  = retrieve_summary_memory(novel_id,   query, top_k=8)
-
+    lore = retrieve_lore_memory(novel_id, query, top_k=6)
+    summaries = retrieve_summary_memory(novel_id, query, top_k=8)
     return f"""
 === STORY ===
 {story}

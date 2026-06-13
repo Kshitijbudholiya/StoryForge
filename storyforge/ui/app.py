@@ -1,224 +1,457 @@
 """
 storyforge.ui.app
 ~~~~~~~~~~~~~~~~~
-DearPyGui window construction and main event loop.
-Entry point: storyforge.ui.app.run()
+MainWindow — assembles topbar, sidebar, chat panel, loader overlay,
+and connects all signals to backend workers.
 """
-
 from __future__ import annotations
 
-import dearpygui.dearpygui as dpg
+import json
+from datetime import datetime
+from pathlib import Path
 
-from storyforge.ui import state
-from storyforge.ui.theme import (
-    apply_global_theme,
-    amber_button_theme,
-    panel_child_theme,
-    AMBER, TEXT, TEXT_DIM, BG, PANEL, PANEL2, BORDER,
-)
-from storyforge.ui.chat import render_chat, update_chat_header, update_toggle_label, push_status
-from storyforge.ui.sidebar import refresh_sidebar
-from storyforge.ui.modals import build_new_novel_modal, open_new_novel_modal
-from storyforge.ui.actions import on_toggle, send_message
+from PyQt6.QtCore    import Qt, QTimer, QSize
+from PyQt6.QtGui     import QFont, QFontDatabase, QIcon, QKeySequence, QShortcut
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                              QHBoxLayout, QLabel, QPushButton, QFrame,
+                              QSplitter, QSizePolicy, QStatusBar)
 
-# ── layout constants ──────────────────────────────────────────────────────────
+from storyforge.ui.style      import STYLESHEET, C_AMBER, C_TEXT_DIM, C_SUCCESS, C_ERROR, C_BG
+from storyforge.ui.widgets    import ToggleSwitch, LoaderOverlay
+from storyforge.ui.sidebar    import Sidebar
+from storyforge.ui.chat_panel import ChatPanel
+from storyforge.ui.dialogs    import NewNovelDialog
+from storyforge.ui.workers    import CreateNovelWorker, SendMessageWorker
 
-WIN_W     = 1280
-WIN_H     = 800
-SIDEBAR_W = 280
-TOPBAR_H  = 48
-STATUSBAR_H = 28
+NOVELS_DIR = Path("novels")
 
 
-# ── public entry point ────────────────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+
+        # ── backend ───────────────────────────────────────────────────────────
+        try:
+            from storyforge.core.novel_manager import NovelManager
+            self._manager = NovelManager()
+            self._has_backend = True
+        except ImportError:
+            self._manager = None
+            self._has_backend = False
+
+        # ── app state ─────────────────────────────────────────────────────────
+        self._active_novel:   str | None = None
+        self._active_scope:   str        = "novel"   # "novel" | "chapter"
+        self._active_chapter: int | None = None
+        self._interactive:    bool       = True
+        self._busy:           bool       = False
+        self._worker = None   # holds current QThread to prevent GC
+
+        # per-context chat history: key -> list[{role,text,time}]
+        # key = novel_id  OR  f"{novel_id}_ch{n}"
+        self._histories: dict[str, list[dict]] = {}
+
+        # ── window setup ──────────────────────────────────────────────────────
+        self.setWindowTitle("StoryForge — AI Novel Writer")
+        self.setMinimumSize(1100, 700)
+        self.resize(1280, 800)
+        self.setStyleSheet(STYLESHEET)
+
+        # ── central layout ────────────────────────────────────────────────────
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_vbox = QVBoxLayout(central)
+        main_vbox.setContentsMargins(0, 0, 0, 0)
+        main_vbox.setSpacing(0)
+
+        # topbar
+        main_vbox.addWidget(self._build_topbar())
+
+        # body row (sidebar + chat)
+        body = QWidget()
+        body_h = QHBoxLayout(body)
+        body_h.setContentsMargins(0, 0, 0, 0)
+        body_h.setSpacing(0)
+
+        self._sidebar = Sidebar()
+        self._sidebar.novel_selected.connect(self._on_novel_selected)
+        self._sidebar.chapter_selected.connect(self._on_chapter_selected)
+        body_h.addWidget(self._sidebar)
+
+        self._chat = ChatPanel()
+        self._chat.message_sent.connect(self._on_message_sent)
+        body_h.addWidget(self._chat, 1)
+
+        main_vbox.addWidget(body, 1)
+
+        # status bar
+        main_vbox.addWidget(self._build_statusbar())
+
+        # ── loader overlay (parented to central so it covers everything) ──────
+        self._loader = LoaderOverlay(central)
+        self._loader.resize(central.size())
+
+        # resize overlay when window resizes
+        central.installEventFilter(self)
+
+        # ── initial data load ─────────────────────────────────────────────────
+        self._sidebar.refresh()
+        self._chat.set_interactive(False)   # nothing selected yet
+
+        # keyboard shortcut: Ctrl+N = new novel
+        sc = QShortcut(QKeySequence("Ctrl+N"), self)
+        sc.activated.connect(self._open_new_novel_dialog)
+
+    # ── event filter (resize overlay) ─────────────────────────────────────────
+
+    def eventFilter(self, obj, event) -> bool:
+        from PyQt6.QtCore import QEvent
+        if event.type() == QEvent.Type.Resize:
+            self._loader.resize(obj.size())
+        return super().eventFilter(obj, event)
+
+    # ── top bar ───────────────────────────────────────────────────────────────
+
+    def _build_topbar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("topbar")
+
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(14, 0, 14, 0)
+        h.setSpacing(10)
+
+        # logo + title
+        logo = QLabel("✦")
+        logo.setObjectName("app_logo")
+        title = QLabel("StoryForge")
+        title.setObjectName("app_title")
+        h.addWidget(logo)
+        h.addSpacing(2)
+        h.addWidget(title)
+        h.addStretch()
+
+        # New Novel button
+        self._new_btn = QPushButton("＋  New Novel")
+        self._new_btn.setObjectName("btn_primary")
+        self._new_btn.setFixedHeight(34)
+        self._new_btn.setToolTip("Create a new novel  (Ctrl+N)")
+        self._new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._new_btn.clicked.connect(self._open_new_novel_dialog)
+        h.addWidget(self._new_btn)
+
+        h.addSpacing(20)
+
+        # Interactive toggle
+        toggle_row = QHBoxLayout()
+        toggle_row.setSpacing(8)
+        toggle_row.setContentsMargins(0, 0, 0, 0)
+
+        self._toggle_label = QLabel("Interactive")
+        self._toggle_label.setObjectName("toggle_label")
+        self._toggle_label.setStyleSheet(f"color: {C_SUCCESS}; font-size: 12px; font-weight: 600;")
+
+        self._toggle = ToggleSwitch(checked=True)
+        self._toggle.toggled.connect(self._on_toggle)
+
+        toggle_row.addWidget(self._toggle_label)
+        toggle_row.addWidget(self._toggle)
+
+        toggle_container = QFrame()
+        toggle_container.setObjectName("toggle_container")
+        toggle_container.setLayout(toggle_row)
+        toggle_container.setFixedHeight(32)
+        h.addWidget(toggle_container)
+
+        return bar
+
+    # ── status bar ────────────────────────────────────────────────────────────
+
+    def _build_statusbar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("statusbar")
+
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(12, 0, 12, 0)
+        h.setSpacing(12)
+
+        self._status_lbl = QLabel("Ready")
+        self._status_lbl.setObjectName("status_text")
+        h.addWidget(self._status_lbl)
+        h.addStretch()
+
+        self._backend_lbl = QLabel(
+            "Backend ready" if self._has_backend else "Demo mode — backend not available"
+        )
+        self._backend_lbl.setObjectName("status_text")
+        h.addWidget(self._backend_lbl)
+
+        return bar
+
+    # ── toggle ────────────────────────────────────────────────────────────────
+
+    def _on_toggle(self, checked: bool) -> None:
+        self._interactive = checked
+        if checked:
+            self._toggle_label.setText("Interactive")
+            self._toggle_label.setStyleSheet(f"color: {C_SUCCESS}; font-size: 12px; font-weight: 600;")
+        else:
+            self._toggle_label.setText("Read-only")
+            self._toggle_label.setStyleSheet(f"color: {C_ERROR}; font-size: 12px; font-weight: 600;")
+
+        self._chat.set_interactive(checked and self._active_novel is not None)
+
+    # ── new novel dialog ──────────────────────────────────────────────────────
+
+    def _open_new_novel_dialog(self) -> None:
+        if self._busy:
+            return
+        dlg = NewNovelDialog(self)
+        if dlg.exec() != NewNovelDialog.DialogCode.Accepted:
+            return
+
+        title   = dlg.title
+        genre   = dlg.genre
+        premise = dlg.premise
+
+        if not self._has_backend or self._manager is None:
+            self._demo_create(title, genre, premise)
+            return
+
+        self._set_busy(True, "Creating novel…")
+        self._loader.show_loading("Generating Novel", "Writing Chapter 1…")
+
+        worker = CreateNovelWorker(self._manager, title, genre, premise)
+        worker.progress.connect(self._loader.update_sub)
+        worker.progress.connect(self._set_status)
+        worker.finished.connect(self._on_novel_created)
+        worker.error.connect(self._on_worker_error)
+        worker.finished.connect(lambda _: self._cleanup_worker())
+        worker.error.connect(lambda _: self._cleanup_worker())
+        self._worker = worker
+        worker.start()
+
+    def _on_novel_created(self, result: dict) -> None:
+        self._loader.hide_loading()
+        self._set_busy(False)
+        self._sidebar.refresh()
+
+        nid      = result["novel_id"]
+        chapter  = result["chapter"]
+        summary  = result["summary"]
+
+        # seed chapter 1 history
+        ts  = datetime.now().strftime("%H:%M")
+        key = f"{nid}_ch1"
+        self._histories[key] = [
+            {"role": "assistant", "text": chapter, "time": ts},
+            {"role": "assistant", "text": "─── Summary ───\n" + summary, "time": ts},
+        ]
+
+        self._switch_context(nid, chapter_num=1)
+        self._set_status("Chapter 1 ready.")
+
+    # ── novel / chapter selection ─────────────────────────────────────────────
+
+    def _on_novel_selected(self, nid: str) -> None:
+        if self._manager and self._has_backend:
+            try:
+                self._manager.load_novel(nid)
+            except Exception:
+                pass
+        self._switch_context(nid, chapter_num=None)
+
+    def _on_chapter_selected(self, nid: str, cnum: int) -> None:
+        if self._manager and self._has_backend:
+            try:
+                self._manager.load_novel(nid)
+            except Exception:
+                pass
+        self._switch_context(nid, chapter_num=cnum)
+
+    def _switch_context(self, nid: str, chapter_num: int | None) -> None:
+        self._active_novel   = nid
+        self._active_chapter = chapter_num
+        self._active_scope   = "chapter" if chapter_num is not None else "novel"
+
+        # get or load history
+        key = self._history_key(nid, chapter_num)
+        if key not in self._histories:
+            self._histories[key] = self._load_history_from_disk(nid, chapter_num)
+
+        # load novel metadata for title
+        title = self._get_novel_title(nid)
+
+        self._chat.set_context(
+            novel_title=title,
+            chapter=chapter_num,
+            history=self._histories[key],
+        )
+        self._chat.set_interactive(self._interactive)
+        self._sidebar.set_active(nid, chapter_num)
+
+    # ── send message ──────────────────────────────────────────────────────────
+
+    def _on_message_sent(self, text: str) -> None:
+        if self._busy:
+            return
+        if not self._active_novel:
+            self._set_status("Select a novel first.")
+            return
+        if not self._interactive:
+            self._set_status("Switch to Interactive mode to generate content.")
+            return
+        if not self._has_backend or self._manager is None:
+            self._chat.add_message("user", text)
+            self._chat.add_message("assistant", f"[Demo] You said: {text}")
+            return
+
+        self._chat.add_message("user", text)
+        self._set_busy(True)
+        self._chat.set_busy(True, "Thinking…")
+
+        worker = SendMessageWorker(
+            self._manager,
+            self._active_novel,
+            text,
+            self._active_scope,
+            self._active_chapter,
+        )
+        worker.progress.connect(self._chat.update_status)
+        worker.answer.connect(self._on_answer_received)
+        worker.chapter.connect(self._on_chapter_generated)
+        worker.error.connect(self._on_worker_error)
+        worker.answer.connect(lambda _: self._cleanup_worker())
+        worker.chapter.connect(lambda _: self._cleanup_worker())
+        worker.error.connect(lambda _: self._cleanup_worker())
+        self._worker = worker
+        worker.start()
+
+    def _on_answer_received(self, text: str) -> None:
+        self._chat.set_busy(False)
+        self._set_busy(False)
+        self._chat.add_message("assistant", text)
+        # persist in history
+        key = self._history_key(self._active_novel, self._active_chapter)
+        self._histories.setdefault(key, [])
+        self._set_status("Done.")
+
+    def _on_chapter_generated(self, pkg: dict) -> None:
+        self._chat.set_busy(False)
+        self._set_busy(False)
+
+        ch_num  = pkg.get("chapter_number", self._active_chapter)
+        chapter = pkg["chapter"]
+        summary = pkg["summary"]
+
+        self._chat.add_message("assistant", chapter)
+        self._chat.add_message("assistant", "─── Summary ───\n" + summary)
+
+        # seed history for the new chapter context
+        ts  = datetime.now().strftime("%H:%M")
+        key = self._history_key(self._active_novel, ch_num)
+        self._histories[key] = [
+            {"role": "assistant", "text": chapter, "time": ts},
+            {"role": "assistant", "text": "─── Summary ───\n" + summary, "time": ts},
+        ]
+
+        self._sidebar.refresh()
+        self._sidebar.set_active(self._active_novel, ch_num)
+        self._active_chapter = ch_num
+        self._active_scope   = "chapter"
+        self._set_status(f"Chapter {ch_num} generated.")
+
+    # ── worker error ──────────────────────────────────────────────────────────
+
+    def _on_worker_error(self, msg: str) -> None:
+        self._loader.hide_loading()
+        self._chat.set_busy(False)
+        self._set_busy(False)
+        self._chat.add_message("assistant", f"⚠ Error: {msg}")
+        self._set_status(f"Error: {msg}")
+
+    def _cleanup_worker(self) -> None:
+        if self._worker:
+            self._worker.quit()
+            self._worker.wait(2000)
+            self._worker = None
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _set_busy(self, busy: bool, msg: str = "") -> None:
+        self._busy = busy
+        self._new_btn.setEnabled(not busy)
+        if msg:
+            self._set_status(msg)
+
+    def _set_status(self, msg: str) -> None:
+        self._status_lbl.setText(msg)
+
+    def _history_key(self, nid: str | None, chapter: int | None) -> str:
+        if nid is None:
+            return "__home__"
+        if chapter is not None:
+            return f"{nid}_ch{chapter}"
+        return nid
+
+    def _get_novel_title(self, nid: str) -> str:
+        path = NOVELS_DIR / f"{nid}.json"
+        try:
+            return json.loads(path.read_text("utf-8")).get("title", "Novel")
+        except Exception:
+            return "Novel"
+
+    def _load_history_from_disk(
+        self, nid: str, chapter: int | None
+    ) -> list[dict]:
+        """Pre-load a chapter's saved text into chat history on first open."""
+        if chapter is None:
+            return []
+        d = NOVELS_DIR / nid
+        ch_path = d / f"chapter_{chapter:03d}.txt"
+        sm_path = d / f"summary_{chapter:03d}.txt"
+        msgs: list[dict] = []
+        if ch_path.exists():
+            msgs.append({
+                "role": "assistant",
+                "text": ch_path.read_text("utf-8"),
+                "time": "saved",
+            })
+        if sm_path.exists():
+            msgs.append({
+                "role": "assistant",
+                "text": "─── Summary ───\n" + sm_path.read_text("utf-8"),
+                "time": "saved",
+            })
+        return msgs
+
+    def _demo_create(self, title: str, genre: str, premise: str) -> None:
+        import uuid
+        nid = str(uuid.uuid4())
+        NOVELS_DIR.mkdir(exist_ok=True)
+        (NOVELS_DIR / f"{nid}.json").write_text(
+            json.dumps({
+                "novel_id": nid, "title": title, "genre": genre,
+                "premise": premise, "current_chapter": 1,
+                "characters": [], "locations": [], "factions": [],
+                "lore_topics": [], "created": True,
+            }, indent=4),
+            encoding="utf-8",
+        )
+        self._sidebar.refresh()
+        self._switch_context(nid, chapter_num=None)
+        self._set_status(f"'{title}' created (demo mode).")
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
 
 def run() -> None:
-    """Initialise backend, build UI, start the render loop."""
+    import sys
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("StoryForge")
+    app.setOrganizationName("StoryForge")
+    app.setStyleSheet(STYLESHEET)
 
-    # ── backend bootstrap ─────────────────────────────────────────────────────
-    try:
-        from storyforge.core.novel_manager import NovelManager
-        state.manager = NovelManager()
-    except ImportError:
-        state.manager = None
+    win = MainWindow()
+    win.show()
 
-    # ── DPG setup ─────────────────────────────────────────────────────────────
-    dpg.create_context()
-    dpg.create_viewport(
-        title="StoryForge — AI Novel Writer",
-        width=WIN_W,
-        height=WIN_H,
-        resizable=False,
-    )
-    dpg.setup_dearpygui()
-
-    apply_global_theme()
-
-    amber_btn_t = amber_button_theme()
-
-    # ── primary window ────────────────────────────────────────────────────────
-    with dpg.window(
-        tag="main_win",
-        label="StoryForge",
-        width=WIN_W,
-        height=WIN_H,
-        no_title_bar=True,
-        no_resize=True,
-        no_move=True,
-        no_scrollbar=True,
-    ):
-
-        # ── top bar ───────────────────────────────────────────────────────────
-        with dpg.child_window(
-            tag="topbar",
-            height=TOPBAR_H,
-            no_scrollbar=True,
-            border=False,
-        ):
-            dpg.bind_item_theme("topbar", panel_child_theme(PANEL))
-
-            with dpg.group(horizontal=True):
-                dpg.add_spacer(width=10)
-                dpg.add_text("◆", color=AMBER)
-                dpg.add_spacer(width=4)
-                dpg.add_text("StoryForge", color=AMBER)
-                dpg.add_spacer(width=16)
-                dpg.add_text("", tag="header_title", color=TEXT)
-
-                # right-aligned controls
-                spacer_w = WIN_W - 390
-                dpg.add_spacer(width=spacer_w)
-
-                nb = dpg.add_button(
-                    label="+ New Novel",
-                    width=110,
-                    callback=open_new_novel_modal,
-                )
-                dpg.bind_item_theme(nb, amber_btn_t)
-
-                dpg.add_spacer(width=16)
-                dpg.add_text("", tag="toggle_label", color=(60, 160, 90, 255))
-                dpg.add_spacer(width=6)
-                dpg.add_checkbox(
-                    tag="toggle_cb",
-                    default_value=True,
-                    callback=on_toggle,
-                )
-                dpg.add_spacer(width=10)
-
-        # ── body row ──────────────────────────────────────────────────────────
-        body_h = WIN_H - TOPBAR_H - STATUSBAR_H
-
-        with dpg.group(horizontal=True):
-
-            # ── sidebar ───────────────────────────────────────────────────────
-            with dpg.child_window(
-                tag="sidebar",
-                width=SIDEBAR_W,
-                height=body_h,
-                border=False,
-            ):
-                dpg.bind_item_theme("sidebar", panel_child_theme(PANEL))
-
-                dpg.add_spacer(height=8)
-                with dpg.group(horizontal=True):
-                    dpg.add_spacer(width=10)
-                    dpg.add_text("YOUR NOVELS", color=AMBER)
-                dpg.add_separator()
-                dpg.add_spacer(height=4)
-
-                # scrollable novel list
-                with dpg.child_window(
-                    tag="sidebar_novel_list",
-                    height=-1,
-                    border=False,
-                ):
-                    dpg.bind_item_theme(
-                        "sidebar_novel_list", panel_child_theme(PANEL)
-                    )
-
-            # ── chat area ─────────────────────────────────────────────────────
-            with dpg.child_window(
-                tag="chat_area",
-                width=WIN_W - SIDEBAR_W,
-                height=body_h,
-                border=False,
-            ):
-                dpg.bind_item_theme("chat_area", panel_child_theme(BG))
-
-                # message scroll area
-                input_row_h = 58
-                scroll_h    = body_h - input_row_h - 12
-
-                with dpg.child_window(
-                    tag="chat_scroll_area",
-                    width=-1,
-                    height=scroll_h,
-                    border=False,
-                ):
-                    _theme = panel_child_theme(BG)
-                    with dpg.theme() as _pad_t:
-                        with dpg.theme_component(dpg.mvChildWindow):
-                            dpg.add_theme_color(
-                                dpg.mvThemeCol_ChildBg, BG,
-                                category=dpg.mvThemeCat_Core,
-                            )
-                            dpg.add_theme_style(
-                                dpg.mvStyleVar_WindowPadding, 12, 10,
-                                category=dpg.mvThemeCat_Core,
-                            )
-                    dpg.bind_item_theme("chat_scroll_area", _pad_t)
-
-                dpg.add_separator()
-
-                # input row
-                with dpg.group(horizontal=True):
-                    dpg.add_spacer(width=8)
-                    dpg.add_input_text(
-                        tag="chat_input",
-                        hint="Write an instruction or ask a question …",
-                        width=WIN_W - SIDEBAR_W - 120,
-                        height=36,
-                        on_enter=True,
-                        callback=send_message,
-                        enabled=True,
-                    )
-                    dpg.add_spacer(width=6)
-                    sb = dpg.add_button(
-                        tag="send_button",
-                        label="Send  ▶",
-                        width=90,
-                        height=36,
-                        callback=send_message,
-                    )
-                    dpg.bind_item_theme(sb, amber_btn_t)
-                    dpg.add_spacer(width=8)
-
-        # ── status bar ────────────────────────────────────────────────────────
-        with dpg.child_window(
-            tag="statusbar",
-            height=STATUSBAR_H,
-            no_scrollbar=True,
-            border=False,
-        ):
-            dpg.bind_item_theme("statusbar", panel_child_theme(PANEL))
-            with dpg.group(horizontal=True):
-                dpg.add_spacer(width=10)
-                dpg.add_text("Ready.", tag="status_bar", color=TEXT_DIM)
-
-    # ── modals ────────────────────────────────────────────────────────────────
-    build_new_novel_modal(WIN_W, WIN_H)
-
-    # ── initial state ─────────────────────────────────────────────────────────
-    update_toggle_label()
-    refresh_sidebar()
-    render_chat()
-
-    # ── render loop ───────────────────────────────────────────────────────────
-    dpg.set_primary_window("main_win", True)
-    dpg.show_viewport()
-
-    while dpg.is_dearpygui_running():
-        dpg.render_dearpygui_frame()
-
-    dpg.destroy_context()
+    sys.exit(app.exec())
